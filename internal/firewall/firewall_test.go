@@ -156,13 +156,26 @@ func fileContains(t *testing.T, path string, patterns ...string) (bool, string) 
 
 // ---- Substrate-boundary firewall pins ---------------------------------
 
+// trustClientCarveOut returns true when the given path is the
+// internal/trust/ escape-service HTTP-client surface. The R145.B
+// own-branch moneycheck-wire-in-escape-service-2026-05-29 landed
+// the long-deferred outbound HTTP surface explicitly named by
+// TestFirewall_NoHTTPClient's comment ("Phase 3 (deferred) and will
+// live on its own R145.B branch with its own outbound HTTP surface").
+// The carve-out is narrowly scoped to internal/trust/ — every other
+// internal/* package remains stdlib-only-no-HTTP.
+func trustClientCarveOut(path string) bool {
+	return strings.Contains(path, string(filepath.Separator)+"trust"+string(filepath.Separator))
+}
+
 // TestFirewall_NoNetHTTPListener pins that no production source file
-// imports net/http for listener use. moneycheck is a library + CLI,
-// not a daemon.
+// imports net/http for LISTENER use. moneycheck is a library + CLI,
+// not a daemon. The internal/trust/ HTTP client carve-out is for
+// outbound calls only; this pin still rejects http.ListenAndServe and
+// net.Listen anywhere in the production tree.
 func TestFirewall_NoNetHTTPListener(t *testing.T) {
 	for _, path := range scanGoFiles(t, false) {
 		if hit, p := fileContains(t, path,
-			`"net/http"`,
 			`http.ListenAndServe`,
 			`net.Listen(`,
 		); hit {
@@ -171,20 +184,48 @@ func TestFirewall_NoNetHTTPListener(t *testing.T) {
 	}
 }
 
-// TestFirewall_NoHTTPClient pins that no production source file imports
-// net/http for client use. The NCA SAR-Online v2 envelope encoder is
-// Phase 3 (deferred) and will live on its own R145.B branch with its
-// own outbound HTTP surface.
+// TestFirewall_NoHTTPClient pins that no production source file OUTSIDE
+// internal/trust/ imports net/http for client use. The internal/trust/
+// carve-out is the escape-service wire (R174 cohort-canonical adoption,
+// IMP-T2-12 Phase 2). Every other internal/* package stays stdlib-only.
 func TestFirewall_NoHTTPClient(t *testing.T) {
 	for _, path := range scanGoFiles(t, false) {
+		if trustClientCarveOut(path) {
+			continue
+		}
 		if hit, p := fileContains(t, path,
 			`"net/http"`,
 			`http.Client`,
 			`http.Get(`,
 			`http.Post(`,
 		); hit {
-			t.Errorf("R145 firewall violation: %s contains %q — HTTP client is out of scope at inception", path, p)
+			t.Errorf("R145 firewall violation: %s contains %q — HTTP client is out of scope outside internal/trust/", path, p)
 		}
+	}
+}
+
+// TestFirewall_TrustPackageIsTheOnlyHTTPClient pins the R145.C
+// equivalence — internal/trust/ is the ONLY production-tree package
+// allowed to import net/http. Future HTTP surfaces (NCA SAR-Online v2,
+// regulator-portal callbacks, etc.) MUST land via their own R145.B
+// branch + their own dedicated carve-out, not by widening this one.
+func TestFirewall_TrustPackageIsTheOnlyHTTPClient(t *testing.T) {
+	var nonTrustHTTPImporters []string
+	for _, path := range scanGoFiles(t, false) {
+		if trustClientCarveOut(path) {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %q: %v", path, err)
+		}
+		if strings.Contains(string(data), `"net/http"`) {
+			nonTrustHTTPImporters = append(nonTrustHTTPImporters, path)
+		}
+	}
+	if len(nonTrustHTTPImporters) > 0 {
+		t.Errorf("R145.C firewall violation: net/http importer found outside internal/trust/:\n%s",
+			strings.Join(nonTrustHTTPImporters, "\n"))
 	}
 }
 
