@@ -35,18 +35,31 @@ Per Phase 1 scaffold scope:
    The Go layer is stateless. Host PSP integrations provide the
    persistent ledger.
 3. **No HTTP listener.** moneycheck is a library + CLI, not a daemon.
-4. **No HTTP outbound client.** The NCA SAR-Online envelope encoder
-   (Phase 3) will live on its own R145.B branch with its own outbound
-   HTTP surface.
+   The R145.C firewall `TestFirewall_NoNetHTTPListener` bans listener
+   primitives (`http.ListenAndServe` / `net.Listen(`) everywhere,
+   **including `internal/stele/`**.
+4. **One confined HTTP outbound client (R145.B stele-anchor amendment,
+   2026-06-12).** `internal/stele/` holds a 5s-timeout stdlib client
+   that POSTs the run audit-ledger anchor to the Stele verified-trust
+   spine (`/v1/verdicts`) when `MONEYCHECK_STELE_URL` is set; unset =
+   no HTTP, no new output. The `net/http` import is confined to that
+   one package by `TestFirewall_NoHTTPClient` +
+   `TestR145B_SteleAnchorConfinement`. The NCA SAR-Online envelope
+   encoder (Phase 3) remains deferred and will live on its own R145.B
+   branch with its own outbound HTTP surface.
 5. **No auth / identity primitives** (no JWT / bcrypt / pbkdf2 /
    crypto/tls). Phase 1 scaffold is offline; Phase 2+ host integrations
    provide auth.
 6. **No PII / no biometrics / no face recognition.** moneycheck operates
    on financial transaction metadata + counterparty identity claims
    per UK GDPR Article 6(1)(c) statutory-basis processing.
-7. **No environment-variable reads** in the cohort + domain packages.
-   `cmd/moneycheck/main.go` may read env vars for CLI config; the
-   library packages do not.
+7. **No environment-variable reads** in the cohort + domain packages
+   (`TestFirewall_NoLibraryEnvVarReads`). `cmd/moneycheck/main.go` is
+   the only env-reading site; after the R145.B stele-anchor amendment
+   (2026-06-12) it reads exactly one variable —
+   `os.Getenv(MONEYCHECK_STELE_URL)` — to opt into Stele spine
+   anchoring. `os.LookupEnv` / `os.Environ` stay banned everywhere
+   (`TestR145B_SteleAnchorConfinement`).
 8. **No external dependencies.** `go.mod` is stdlib-only; the R145.C
    firewall pins `TestFirewall_NoExternalDeps` to enforce this.
 

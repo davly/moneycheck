@@ -166,6 +166,153 @@ func TestEmit_R175_StampUsesClearedMirrorMarkInput(t *testing.T) {
 	}
 }
 
+// newTestMarkerLedger builds a ledger backed by a deterministic
+// production-style marker (non-placeholder) so SelfCheck can verify
+// real marks.
+func newTestMarkerLedger(t *testing.T) *Ledger {
+	t.Helper()
+	var corpus [sha256.Size]byte
+	corpus[0] = 0xAB
+	marker, err := mirrormark.NewStdlibMarker(corpus, []byte("selfcheck-test-key-32-bytes-long"))
+	if err != nil {
+		t.Fatalf("NewStdlibMarker: %v", err)
+	}
+	return NewLedger(marker)
+}
+
+// TestSelfCheck_PassDeterministic pins that SelfCheck over a clean
+// ledger returns the entry count + a deterministic digest, and that
+// the digest matches the documented canonical serialization
+// (sha256 over json.Marshal(entry) || '\n' per stamped entry in
+// append order).
+func TestSelfCheck_PassDeterministic(t *testing.T) {
+	ledger := newTestMarkerLedger(t)
+	// Pin entry IDs + timestamps so the digest is reproducible.
+	for i, ref := range []string{"claim-A", "claim-B"} {
+		ledger.entries = append(ledger.entries, mustStamp(t, ledger, Entry{
+			EntryID:   formatEntryID(i + 1),
+			Class:     EntryClassPSRDisposition,
+			Timestamp: "2026-06-12T00:00:00.000Z",
+			Reference: ref,
+			Payload:   json.RawMessage(`{"disposition":"placeholder"}`),
+		}))
+	}
+
+	n, digest, err := ledger.SelfCheck()
+	if err != nil {
+		t.Fatalf("SelfCheck() = %v, want nil", err)
+	}
+	if n != 2 {
+		t.Errorf("SelfCheck entry count = %d, want 2", n)
+	}
+
+	// Independently re-derive the documented digest.
+	h := sha256.New()
+	for _, e := range ledger.Entries() {
+		line, err := json.Marshal(e)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		h.Write(line)
+		h.Write([]byte{'\n'})
+	}
+	var want [sha256.Size]byte
+	copy(want[:], h.Sum(nil))
+	if digest != want {
+		t.Errorf("digest = %x, want %x (documented canonical serialization)", digest, want)
+	}
+
+	// Determinism: a second self-check of the same state → same digest.
+	_, digest2, err := ledger.SelfCheck()
+	if err != nil || digest2 != digest {
+		t.Errorf("SelfCheck non-deterministic: digest2=%x err=%v", digest2, err)
+	}
+}
+
+// mustStamp emits an entry through the ledger's marker without going
+// through the public auto-ID/auto-timestamp path, so a test can pin
+// exact entry bytes (EntryID + Timestamp pre-set). It mirrors Emit's
+// clear-then-marshal-then-stamp discipline.
+func mustStamp(t *testing.T, l *Ledger, e Entry) Entry {
+	t.Helper()
+	e.MirrorMark = ""
+	body, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("mustStamp marshal: %v", err)
+	}
+	e.MirrorMark = l.marker.Sign(body)
+	return e
+}
+
+// TestSelfCheck_TamperDetected pins the integrity gate: mutating an
+// entry's payload after stamping breaks SelfCheck (mark no longer
+// re-derives) and yields a zero digest.
+func TestSelfCheck_TamperDetected(t *testing.T) {
+	ledger := newTestMarkerLedger(t)
+	ledger.Emit(Entry{Class: EntryClassPSRDisposition, Reference: "ok", Payload: json.RawMessage(`{"v":1}`)})
+
+	// Clean self-check first.
+	if _, _, err := ledger.SelfCheck(); err != nil {
+		t.Fatalf("clean SelfCheck = %v, want nil", err)
+	}
+
+	// Tamper with the in-memory entry payload (mark stays stale).
+	ledger.entries[0].Payload = json.RawMessage(`{"v":2}`)
+
+	n, digest, err := ledger.SelfCheck()
+	if err == nil {
+		t.Fatalf("SelfCheck on tampered entry = nil error, want mismatch")
+	}
+	if n != 0 || digest != ([sha256.Size]byte{}) {
+		t.Errorf("tampered SelfCheck = (%d, %x), want (0, zero-digest)", n, digest)
+	}
+}
+
+// TestSelfCheck_MissingPrefixRejected pins that an entry whose mark
+// lacks the cohort-canonical "lore@v1:" prefix (e.g. an unsigned
+// nil-marker emit smuggled in) fails self-check.
+func TestSelfCheck_MissingPrefixRejected(t *testing.T) {
+	ledger := newTestMarkerLedger(t)
+	ledger.entries = append(ledger.entries, Entry{
+		EntryID:    "MC-00000001",
+		Class:      EntryClassPSRDisposition,
+		Timestamp:  "2026-06-12T00:00:00.000Z",
+		MirrorMark: "", // missing prefix
+	})
+	if _, _, err := ledger.SelfCheck(); err == nil {
+		t.Fatalf("SelfCheck on prefix-less entry = nil error, want failure")
+	}
+}
+
+// TestSelfCheck_NilMarkerRefuses pins that a ledger with no marker
+// configured cannot self-check green (an unsigned ledger must never be
+// anchored LIT).
+func TestSelfCheck_NilMarkerRefuses(t *testing.T) {
+	ledger := NewLedger(nil)
+	ledger.Emit(Entry{Class: EntryClassAdvisoryFired, Reference: "unsigned"})
+	if _, _, err := ledger.SelfCheck(); err == nil {
+		t.Fatalf("SelfCheck on nil-marker ledger = nil error, want refusal")
+	}
+}
+
+// TestSelfCheck_EmptyLedger pins that an empty ledger self-checks green
+// with a stable digest (sha256 of the empty stream).
+func TestSelfCheck_EmptyLedger(t *testing.T) {
+	ledger := newTestMarkerLedger(t)
+	n, digest, err := ledger.SelfCheck()
+	if err != nil {
+		t.Fatalf("empty SelfCheck = %v, want nil", err)
+	}
+	if n != 0 {
+		t.Errorf("empty SelfCheck count = %d, want 0", n)
+	}
+	var wantEmpty [sha256.Size]byte
+	copy(wantEmpty[:], sha256.New().Sum(nil))
+	if digest != wantEmpty {
+		t.Errorf("empty-ledger digest = %x, want sha256-of-empty %x", digest, wantEmpty)
+	}
+}
+
 // TestEmit_GoroutineSafe ensures concurrent Emit calls do not corrupt
 // the ledger state. Pin the mutex contract.
 func TestEmit_GoroutineSafe(t *testing.T) {

@@ -28,7 +28,10 @@
 package audit_ledger
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -222,6 +225,74 @@ func VerifyEntry(entry Entry, marker mirrormark.Marker) error {
 		return mirrormark.ErrMarkMismatch
 	}
 	return nil
+}
+
+// SelfCheck re-derives every entry's Mirror-Mark from its canonical
+// body via this ledger's OWN marker and compares it against the
+// carried MirrorMark. On success it returns the entry count plus the
+// ledger digest; on the first mismatch it returns a non-nil error and
+// a zero digest (callers MUST NOT anchor/attest a ledger whose
+// self-check failed).
+//
+// LEDGER DIGEST — canonical run serialization (documented contract):
+// sha256 over, for each appended Entry in append order,
+//
+//	json.Marshal(entry) || '\n'
+//
+// where each entry carries its STAMPED MirrorMark. Go's encoding/json
+// marshals struct fields in declaration order (entry_id, class,
+// timestamp, reference, payload, advisory_codes, mirror_mark), so the
+// byte stream is deterministic: identical entries in identical order
+// produce an identical digest, and any change to entry content, mark,
+// or ORDER changes it. The ledger is not hash-chained (Phase-1
+// in-memory scaffold), so this digest is the canonical binding for a
+// Stele spine anchor's subject_hash.
+//
+// Each entry is re-verified with VerifyEntry (the existing per-entry
+// cold-verify building block) before it contributes to the digest, so
+// a tampered in-memory row fails the self-check rather than producing
+// a digest over corrupted bytes.
+//
+// HONESTY: this is a SELF-check — the same marker that stamped the
+// entries re-derives the marks. It surfaces post-Emit tampering of
+// in-memory entries, but it is NOT an independent oracle and does NOT
+// prove the marker key is production-grade (a placeholder-mode marker
+// self-checks green; the R143 LOUD-ONCE-WARN advisory covers that
+// loudly). Downstream consumers describing this check MUST label it
+// self-check, not gauntlet.
+//
+// If the ledger's marker is nil, SelfCheck returns an error rather
+// than silently digesting unsigned entries (an unsigned ledger must
+// never be anchored LIT).
+func (l *Ledger) SelfCheck() (int, [sha256.Size]byte, error) {
+	var digest [sha256.Size]byte
+	l.mu.Lock()
+	marker := l.marker
+	snap := make([]Entry, len(l.entries))
+	copy(snap, l.entries)
+	l.mu.Unlock()
+
+	if marker == nil {
+		return 0, digest, fmt.Errorf("audit_ledger: self-check failed: ledger has no marker configured (unsigned ledger must not be anchored)")
+	}
+
+	h := sha256.New()
+	for i, entry := range snap {
+		if !strings.HasPrefix(entry.MirrorMark, mirrormark.MarkPrefix) {
+			return 0, digest, fmt.Errorf("audit_ledger: self-check failed: entry %d (%s) mark missing cohort-canonical prefix %q", i, entry.EntryID, mirrormark.MarkPrefix)
+		}
+		if err := VerifyEntry(entry, marker); err != nil {
+			return 0, digest, fmt.Errorf("audit_ledger: self-check failed: entry %d (%s) mark does not re-derive from canonical body (entry or mark tampered): %w", i, entry.EntryID, err)
+		}
+		line, err := json.Marshal(entry)
+		if err != nil {
+			return 0, digest, fmt.Errorf("audit_ledger: self-check failed: entry %d (%s) serialization: %w", i, entry.EntryID, err)
+		}
+		h.Write(line)
+		h.Write([]byte{'\n'})
+	}
+	copy(digest[:], h.Sum(nil))
+	return len(snap), digest, nil
 }
 
 // formatEntryID returns the canonical sequence-number entry ID.

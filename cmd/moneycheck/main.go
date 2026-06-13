@@ -23,6 +23,7 @@ import (
 	"github.com/davly/moneycheck/internal/lore"
 	"github.com/davly/moneycheck/internal/mirrormark"
 	"github.com/davly/moneycheck/internal/psr_app_fraud"
+	"github.com/davly/moneycheck/internal/stele"
 )
 
 const version = "0.1.0-phase-1-scaffold"
@@ -42,6 +43,13 @@ Phase 1 scaffold notice:
   AML SAR NCA envelope encoder (Phase 3), FCA COBS 4 disclosure renderer
   (Phase 4), and PSD2 SCA exemption table (Phase 4) are deferred. The R143
   LOUD-ONCE-WARN advisories surface the deferral.
+
+Stele spine anchoring (opt-in):
+  When MONEYCHECK_STELE_URL is set, 'decide' and 'sar' anchor the run's
+  audit ledger into the Stele verified-trust spine after a passing
+  ledger self-check, and print the spine receipt (seq + entry_hash).
+  Unset/empty = disabled (no HTTP, no new output; behavior is identical
+  to the argv-only CLI). A requested anchor that fails exits non-zero.
 `)
 }
 
@@ -118,6 +126,9 @@ func runDecide(args []string) {
 	fmt.Printf("mirror_mark:           %s\n", entry.MirrorMark)
 	fmt.Printf("advisory_codes:        %v\n", out.AdvisoryCodes)
 	fmt.Printf("rationale:             %s\n", out.Rationale)
+
+	maybeAnchorToStele(ledger, "decide")
+
 	fmt.Println()
 	fmt.Println(r166LiabilityFooter())
 }
@@ -165,8 +176,37 @@ func runSAR(args []string) {
 	fmt.Printf("ledger_entry_id:       %s\n", entry.EntryID)
 	fmt.Printf("mirror_mark:           %s\n", entry.MirrorMark)
 	fmt.Printf("advisory_codes:        %v\n", receipt.AdvisoryCodes)
+
+	maybeAnchorToStele(ledger, "sar")
+
 	fmt.Println()
 	fmt.Println(r166LiabilityFooter())
+}
+
+// maybeAnchorToStele anchors the run's audit ledger into the Stele
+// spine when MONEYCHECK_STELE_URL is set. Unset/empty = disabled: no
+// self-check, no HTTP, no output — behavior identical to a
+// non-anchoring run. This is moneycheck's ONLY env read (R145.B
+// stele-anchor re-pin in internal/firewall/); the read lives here in
+// cmd/ because the library packages stay env-free (firewall
+// TestFirewall_NoLibraryEnvVarReads).
+//
+// Honesty rules (load-bearing):
+//   - the sealed line prints ONLY after the spine returned
+//     201 + entry_hash (stele.AnchorRun enforces this);
+//   - a requested anchor that fails — ledger self-check, network,
+//     non-201 — prints to stderr and exits non-zero, so a missing
+//     anchor can never look like success.
+func maybeAnchorToStele(ledger *audit_ledger.Ledger, command string) {
+	rcpt, anchored, err := stele.AnchorRun(os.Getenv(stele.EnvURL), command, ledger, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stele anchor FAILED (%s set, anchor requested but NOT sealed): %v\n", stele.EnvURL, err)
+		os.Exit(1)
+	}
+	if !anchored {
+		return
+	}
+	fmt.Printf("stele anchor:          sealed seq=%d entry_hash=%s\n", rcpt.Seq, rcpt.EntryHash)
 }
 
 // runKAT1 prints the cohort canonical KAT-1 hex anchor.

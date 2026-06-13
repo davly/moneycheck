@@ -31,6 +31,23 @@
 //     HMAC over the canonical body (with mark cleared). Cold-verify
 //     holds without trusting the PSP filesystem.
 //
+// R145.B AMENDMENT (2026-06-12, branch claude/stele-anchor-2026-06-12):
+// moneycheck is wired as a flagship consumer of the Stele
+// verified-trust spine. Two inception invariants are deliberately
+// NARROWED (not dropped) on this sibling branch, with paired
+// regression pins in TestR145B_SteleAnchorConfinement:
+//
+//   - HTTP CLIENT: permitted ONLY in internal/stele/ (a 5s-timeout
+//     stdlib client POSTing run-ledger anchors to the spine's
+//     /v1/verdicts). Listener primitives stay banned EVERYWHERE,
+//     including internal/stele/. The Phase-3 NCA SAR-Online envelope
+//     encoder still needs its OWN R145.B branch.
+//   - ENV READS: cmd/moneycheck/main.go was already exempt from the
+//     library env-read ban at inception; the R145.B pin tightens that
+//     exemption to exactly ONE site — os.Getenv(stele.EnvURL).
+//     Unset/empty means anchoring is disabled and behavior is
+//     byte-identical to the argv-only inception CLI.
+//
 // The firewall is the difference between "we say moneycheck has no
 // HTTP listener" (decorative claim) and "moneycheck CANNOT have an
 // HTTP listener under R145-strict without a sibling branch breaking
@@ -50,6 +67,7 @@ import (
 	"github.com/davly/moneycheck/internal/lore"
 	"github.com/davly/moneycheck/internal/manifest"
 	"github.com/davly/moneycheck/internal/mirrormark"
+	"github.com/davly/moneycheck/internal/stele"
 )
 
 // repoRoot walks up from the test working directory until it finds
@@ -156,34 +174,61 @@ func fileContains(t *testing.T, path string, patterns ...string) (bool, string) 
 
 // ---- Substrate-boundary firewall pins ---------------------------------
 
+// inSteleDir reports whether path lives under internal/stele/ — the
+// ONE package permitted to hold an HTTP client after the R145.B
+// stele-anchor amendment (2026-06-12).
+func inSteleDir(path string) bool {
+	sep := string(filepath.Separator)
+	return strings.Contains(path, sep+"stele"+sep)
+}
+
 // TestFirewall_NoNetHTTPListener pins that no production source file
 // imports net/http for listener use. moneycheck is a library + CLI,
-// not a daemon.
+// not a daemon. R145.B stele-anchor amendment: internal/stele/ may
+// import net/http (client-only — see TestFirewall_NoHTTPClient) but
+// the listener PRIMITIVES stay banned everywhere, including
+// internal/stele/.
 func TestFirewall_NoNetHTTPListener(t *testing.T) {
 	for _, path := range scanGoFiles(t, false) {
-		if hit, p := fileContains(t, path,
+		patterns := []string{
 			`"net/http"`,
 			`http.ListenAndServe`,
 			`net.Listen(`,
-		); hit {
+		}
+		if inSteleDir(path) {
+			// The bare import is the spine client's; listener
+			// primitives remain forbidden even here.
+			patterns = []string{
+				`http.ListenAndServe`,
+				`net.Listen(`,
+				`httptest.NewServer`, // test-double servers belong in _test.go only
+			}
+		}
+		if hit, p := fileContains(t, path, patterns...); hit {
 			t.Errorf("R145 firewall violation: %s contains %q — net/http listener is out of scope; open a sibling branch", path, p)
 		}
 	}
 }
 
 // TestFirewall_NoHTTPClient pins that no production source file imports
-// net/http for client use. The NCA SAR-Online v2 envelope encoder is
-// Phase 3 (deferred) and will live on its own R145.B branch with its
-// own outbound HTTP surface.
+// net/http for client use — EXCEPT internal/stele/ (R145.B
+// stele-anchor amendment 2026-06-12: the spine-anchoring client is
+// confined to that one package; paired pins in
+// TestR145B_SteleAnchorConfinement). The NCA SAR-Online v2 envelope
+// encoder is Phase 3 (deferred) and will live on its own R145.B branch
+// with its own outbound HTTP surface.
 func TestFirewall_NoHTTPClient(t *testing.T) {
 	for _, path := range scanGoFiles(t, false) {
+		if inSteleDir(path) {
+			continue
+		}
 		if hit, p := fileContains(t, path,
 			`"net/http"`,
 			`http.Client`,
 			`http.Get(`,
 			`http.Post(`,
 		); hit {
-			t.Errorf("R145 firewall violation: %s contains %q — HTTP client is out of scope at inception", path, p)
+			t.Errorf("R145 firewall violation: %s contains %q — HTTP client out of scope outside internal/stele", path, p)
 		}
 	}
 }
@@ -252,6 +297,74 @@ func TestFirewall_NoExternalDeps(t *testing.T) {
 	gosum := filepath.Join(root, "go.sum")
 	if _, err := os.Stat(gosum); err == nil {
 		t.Errorf("R145 firewall violation: go.sum exists at %q; stdlib-only repos should not have one", gosum)
+	}
+}
+
+// ---- R145.B stele-anchor paired regression pins (2026-06-12) ----------
+
+// TestR145B_SteleAnchorConfinement is the paired regression pin for
+// the two NARROWED inception invariants (HTTP client + env read). It
+// pins the NEW invariant shape so any further drift breaks a test:
+//
+//  1. every production net/http usage lives under internal/stele/;
+//  2. the stele client carries the 5-second timeout;
+//  3. os.Getenv appears in exactly one production file
+//     (cmd/moneycheck/main.go) and only as os.Getenv(stele.EnvURL);
+//     no os.LookupEnv / os.Environ anywhere;
+//  4. the spine wire-contract constants hold (env var name,
+//     substrate, honest oracle-strength label).
+func TestR145B_SteleAnchorConfinement(t *testing.T) {
+	var netHTTPFiles, getenvFiles []string
+	for _, path := range scanGoFiles(t, false) {
+		if hit, _ := fileContains(t, path, `"net/http"`); hit {
+			netHTTPFiles = append(netHTTPFiles, path)
+		}
+		if hit, _ := fileContains(t, path, `os.Getenv(`); hit {
+			getenvFiles = append(getenvFiles, path)
+		}
+		// os.LookupEnv / os.Environ stay banned EVERYWHERE — no
+		// R145.B exemption was opened for them.
+		if hit, p := fileContains(t, path, `os.LookupEnv(`, `os.Environ(`); hit {
+			t.Errorf("R145.B pin violation: %s contains %q — only os.Getenv(stele.EnvURL) was exempted", path, p)
+		}
+	}
+
+	// (1) net/http confined to internal/stele/ — and present there
+	// (the wire is load-bearing, not decorative).
+	if len(netHTTPFiles) == 0 {
+		t.Errorf("R145.B pin violation: no production file imports net/http — the stele spine wire is gone; re-pin the firewall if this is deliberate")
+	}
+	for _, path := range netHTTPFiles {
+		if !inSteleDir(path) {
+			t.Errorf("R145.B pin violation: %s imports net/http outside internal/stele/", path)
+		}
+	}
+
+	// (2) the stele client keeps its 5s timeout.
+	steleSrc := filepath.Join(repoRoot(t), "internal", "stele", "stele.go")
+	if hit, _ := fileContains(t, steleSrc, `Timeout: 5 * time.Second`); !hit {
+		t.Errorf("R145.B pin violation: %s missing the 5-second http.Client timeout", steleSrc)
+	}
+
+	// (3) exactly one env-read site: os.Getenv(stele.EnvURL) in
+	// cmd/moneycheck/main.go.
+	wantGetenv := filepath.Join(repoRoot(t), "cmd", "moneycheck", "main.go")
+	if len(getenvFiles) != 1 || getenvFiles[0] != wantGetenv {
+		t.Errorf("R145.B pin violation: os.Getenv sites = %v, want exactly [%s]", getenvFiles, wantGetenv)
+	}
+	if hit, _ := fileContains(t, wantGetenv, `os.Getenv(stele.EnvURL)`); !hit {
+		t.Errorf("R145.B pin violation: %s does not read os.Getenv(stele.EnvURL)", wantGetenv)
+	}
+
+	// (4) spine wire-contract constants.
+	if stele.EnvURL != "MONEYCHECK_STELE_URL" {
+		t.Errorf("R145.B pin violation: stele.EnvURL = %q, want MONEYCHECK_STELE_URL", stele.EnvURL)
+	}
+	if stele.Substrate != "flagships/moneycheck/audit-ledger" {
+		t.Errorf("R145.B pin violation: stele.Substrate = %q, want flagships/moneycheck/audit-ledger", stele.Substrate)
+	}
+	if stele.OracleStrengthSelfCheck != "Self-Check" {
+		t.Errorf("R145.B pin violation: stele.OracleStrengthSelfCheck = %q, want Self-Check (honesty label is load-bearing)", stele.OracleStrengthSelfCheck)
 	}
 }
 
