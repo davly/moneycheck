@@ -164,6 +164,115 @@ func TestSealNetworkError(t *testing.T) {
 	}
 }
 
+// --- HTTPS-enforcement (transport-confidentiality) pins ----------------
+
+// TestSealRejectsNonLoopbackHTTP is the load-bearing discrimination pin:
+// a non-loopback http:// spine URL anchors the run-ledger digest in
+// CLEARTEXT over the network. The seal MUST fail-closed (non-nil error,
+// NO HTTP request emitted) for any non-loopback http:// host. Reverting
+// the HTTPS-enforcement guard makes this test fail: Seal would dial the
+// plaintext host and surface a connection/transport error (or worse,
+// succeed) rather than the explicit insecure-scheme refusal.
+func TestSealRejectsNonLoopbackHTTP(t *testing.T) {
+	for _, url := range []string{
+		"http://spine.example.com",
+		"http://spine.example.com:8097",
+		"http://10.0.0.5:8097",            // RFC1918 — still cleartext on the wire
+		"http://192.168.1.10",             // RFC1918
+		"http://203.0.113.7/",             // public literal IP
+		"HTTP://Spine.Example.Com:8097",   // scheme/host case-insensitivity
+	} {
+		_, err := NewClient(url).Seal(NewRunAnchor("decide", 1, fixedDigest(), time.Now().UTC()))
+		if err == nil {
+			t.Errorf("Seal(%q) = nil error, want fail-closed refusal of cleartext anchor to a non-loopback host", url)
+			continue
+		}
+		if !strings.Contains(err.Error(), "https") {
+			t.Errorf("Seal(%q) error = %q, want a message naming the https requirement", url, err)
+		}
+	}
+}
+
+// TestSealRejectsNonHTTPScheme pins that categorically unsafe schemes
+// (file://, gopher://, etc.) and schemeless/garbage URLs are refused
+// before any I/O — the anchor seam only ever speaks HTTP(S).
+func TestSealRejectsNonHTTPScheme(t *testing.T) {
+	for _, url := range []string{
+		"file:///etc/passwd",
+		"gopher://spine.example.com",
+		"ftp://spine.example.com",
+		"spine.example.com:8097", // no scheme → host parses as scheme; reject
+	} {
+		_, err := NewClient(url).Seal(NewRunAnchor("decide", 1, fixedDigest(), time.Now().UTC()))
+		if err == nil {
+			t.Errorf("Seal(%q) = nil error, want refusal of a non-http(s) scheme", url)
+		}
+	}
+}
+
+// TestSealAllowsLoopbackHTTP pins the explicit opt-out: http:// is
+// allowed for loopback hosts (the documented MONEYCHECK_STELE_URL
+// example is http://localhost:8097, and every httptest.NewServer binds
+// to 127.0.0.1) — local dev/anchoring against a co-located spine stays
+// cleartext-OK because the bytes never leave the host. This guards
+// against an over-broad fix that would break the loopback workflow.
+func TestSealAllowsLoopbackHTTP(t *testing.T) {
+	// 127.0.0.1 (httptest default) — the existing success-path tests
+	// already exercise this, re-pinned here explicitly alongside the
+	// hostname form.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintln(w, `{"sealed":{"seq":7,"entry_hash":"loopbackok"}}`)
+	}))
+	defer srv.Close()
+
+	rcpt, err := NewClient(srv.URL).Seal(NewRunAnchor("decide", 1, fixedDigest(), time.Now().UTC()))
+	if err != nil {
+		t.Fatalf("Seal against loopback http server = %v, want success (loopback http is allowed)", err)
+	}
+	if rcpt.EntryHash != "loopbackok" {
+		t.Errorf("receipt = %+v, want entry_hash=loopbackok", rcpt)
+	}
+
+	// "localhost" hostname form must also be accepted by the scheme
+	// guard (it fails later at the dial, not at the guard — so the
+	// error, if any, must NOT be the https-scheme refusal).
+	_, err = NewClient("http://localhost:0").Seal(NewRunAnchor("decide", 1, fixedDigest(), time.Now().UTC()))
+	if err != nil && strings.Contains(err.Error(), "https") {
+		t.Errorf("Seal(http://localhost:0) wrongly refused by the https guard: %v", err)
+	}
+}
+
+// TestSealAllowsHTTPSAnyHost pins that https:// is accepted for any host
+// — the guard's whole purpose is to permit confidential transport
+// anywhere while restricting cleartext to loopback. A dial to an
+// unroutable https host fails at the network layer, NOT at the scheme
+// guard, so the error (if any) must not be the https refusal.
+func TestSealAllowsHTTPSAnyHost(t *testing.T) {
+	_, err := NewClient("https://spine.example.com:8097").Seal(NewRunAnchor("decide", 1, fixedDigest(), time.Now().UTC()))
+	if err != nil && strings.Contains(err.Error(), "requires https") {
+		t.Errorf("Seal(https://...) wrongly refused by the https guard: %v", err)
+	}
+}
+
+// TestAnchorRunRejectsNonLoopbackHTTP pins the guard end-to-end through
+// the single CLI seam: a passing self-check followed by a cleartext
+// non-loopback anchor target must surface a loud error with
+// anchored=false — never a silent cleartext seal.
+func TestAnchorRunRejectsNonLoopbackHTTP(t *testing.T) {
+	fc := &fakeChecker{entries: 1, digest: fixedDigest()}
+	_, anchored, err := AnchorRun("http://spine.example.com:8097", "decide", fc, time.Now().UTC())
+	if err == nil {
+		t.Fatalf("AnchorRun(non-loopback http) = nil error, want fail-closed refusal")
+	}
+	if anchored {
+		t.Errorf("anchored = true on a refused cleartext anchor")
+	}
+	if !strings.Contains(err.Error(), "https") {
+		t.Errorf("AnchorRun error = %q, want a message naming the https requirement", err)
+	}
+}
+
 // TestAnchorRunDisabled pins the off-by-default contract: empty (or
 // whitespace) URL means NO self-check, NO HTTP, no receipt, no error —
 // behavior identical to a non-anchoring run.

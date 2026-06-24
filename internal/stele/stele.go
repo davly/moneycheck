@@ -37,7 +37,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -122,11 +124,75 @@ func NewRunAnchor(command string, entries int, ledgerDigest [sha256.Size]byte, s
 	}
 }
 
+// requireSecureURL enforces transport confidentiality for the anchor
+// POST. The run-ledger anchor carries the subject_hash (the sha256 of
+// the canonical ledger serialization) plus evidence text describing the
+// run; sending it over plaintext http:// to a remote host would expose
+// it to on-path eavesdropping and tampering. This is a deliberate
+// FAIL-CLOSED gate (mirrors the ecosystem SDK / aicore SSRF loopback
+// idiom — foundation/aicore/ssrf/classify.go):
+//
+//   - https:// is allowed to ANY host (confidential transport);
+//   - http:// is allowed ONLY for a loopback host (127.0.0.0/8, ::1,
+//     or the literal "localhost") — a co-located dev spine whose bytes
+//     never leave the machine. This keeps the documented
+//     MONEYCHECK_STELE_URL=http://localhost:8097 example and every
+//     loopback-bound (127.0.0.1) test server working;
+//   - any other scheme (file://, gopher://, a bare host parsed as a
+//     scheme, …) is refused.
+//
+// Network-free: it inspects only the textual scheme + host literal and
+// performs no DNS resolution, so it can run before any I/O.
+func requireSecureURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("stele seal: invalid spine URL %q: %w", rawURL, err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	switch scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("stele seal: refusing to anchor over cleartext http:// to non-loopback host %q — the spine URL requires https:// (http is permitted only for loopback/localhost)", u.Host)
+	default:
+		return fmt.Errorf("stele seal: spine URL %q must use https:// (or http:// for loopback only); scheme %q is not supported", rawURL, u.Scheme)
+	}
+}
+
+// isLoopbackHost reports whether host is the literal "localhost" or a
+// loopback IP literal (127.0.0.0/8 or ::1). Hostnames other than
+// "localhost" are NOT resolved (network-free), so a hostname that would
+// resolve to a loopback IP is treated as non-loopback — the conservative
+// fail-closed choice for a confidentiality gate.
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 // Seal POSTs the verdict to /v1/verdicts and returns the spine
 // receipt. It returns an error — and the caller MUST NOT claim the
 // anchor happened — unless the spine answered 201 Created with a
 // non-empty entry_hash.
+//
+// Before any network I/O it enforces transport confidentiality via
+// requireSecureURL: a non-loopback http:// (or non-HTTP) spine URL is
+// refused fail-closed so the run-ledger anchor is never emitted in
+// cleartext to a remote host.
 func (c *Client) Seal(v Verdict) (Receipt, error) {
+	if err := requireSecureURL(c.baseURL); err != nil {
+		return Receipt{}, err
+	}
 	body, err := json.Marshal(v)
 	if err != nil {
 		return Receipt{}, fmt.Errorf("stele seal: marshal: %w", err)
